@@ -47,7 +47,6 @@ from .worker import (
     ConnectWorker,
     CreateUserWorker,
     DeviceActionWorker,
-    EnrollWorker,
 )
 
 GREEN_CELL = "#dcfce7"
@@ -70,7 +69,7 @@ class MainWindow(QMainWindow):
         self.device: ZKDevice | None = None
         self.worker: CaptureWorker | None = None
         self.connect_worker: ConnectWorker | None = None
-        self.enroll_dialog: NewUserDialog | None = None
+        self.new_user_dialog: NewUserDialog | None = None
         self.action_worker: DeviceActionWorker | None = None
         self.capturing = False
         self.connected = False
@@ -81,6 +80,8 @@ class MainWindow(QMainWindow):
         self._device_action_on_failed = None
         self._closing = False
         self._workers: set = set()
+        self._create_worker = None
+        self._weekly_warning_week = None
 
         self._build_ui()
         self._check_weekly_on_startup()
@@ -415,16 +416,12 @@ class MainWindow(QMainWindow):
             if not self._closing and self.connected and self.device is not None:
                 self.start_capture()
 
-    # -- user enrollment (two steps) -------------------------------------
+    # -- user creation ---------------------------------------------------
     def _busy_with_user_op(self) -> bool:
-        for attr in ("_create_worker", "_enroll_worker"):
-            worker = getattr(self, attr, None)
-            if worker is not None and worker.isRunning():
-                return True
-        return False
+        return self._create_worker is not None and self._create_worker.isRunning()
 
     def create_device_user(self, name: str, user_id: str | None, on_progress, on_created, on_failed) -> CreateUserWorker | str | None:
-        """Step 1: create the user record on the device (ID + name)."""
+        """Create the user record on the device (ID + name)."""
         if not self.connected:
             return None
         if self._busy_with_device_op() or self._busy_with_user_op():
@@ -459,42 +456,6 @@ class MainWindow(QMainWindow):
         worker.start()
         return worker
 
-    def enroll_fingerprint(self, uid: int, badge: str, on_progress, on_enrolled, on_failed) -> EnrollWorker | str | None:
-        """Step 2: activate the device fingerprint scanner for an existing user."""
-        if not self.connected:
-            return None
-        if self._busy_with_device_op() or self._busy_with_user_op():
-            QMessageBox.warning(
-                self, "Nuevo usuario", "Espera a que termine la operación en curso."
-            )
-            return None
-        if self.capturing:
-            self._restart_capture_after_action = True
-            self.stop_capture()
-            self._pending_action = ("enroll", (uid, badge, on_progress, on_enrolled, on_failed))
-            self.set_status("Esperando a que la captura se detenga...")
-            return ENROLL_PENDING
-        return self._launch_enroll(uid, badge, on_progress, on_enrolled, on_failed)
-
-    def _launch_enroll(self, uid, badge, on_progress, on_enrolled, on_failed) -> EnrollWorker:
-        worker = EnrollWorker(self.config, uid, badge)
-
-        def handle_ok(b_result: str, u_result: int) -> None:
-            self._after_device_action()
-            on_enrolled(b_result, u_result)
-
-        def handle_bad(message: str) -> None:
-            self._after_device_action()
-            on_failed(message)
-
-        worker.progress.connect(on_progress)
-        worker.enrolled.connect(handle_ok)
-        worker.failed.connect(handle_bad)
-        self._enroll_worker = worker
-        self._spawn(worker)
-        worker.start()
-        return worker
-
     def _dispatch_pending_action(self) -> None:
         pending = self._pending_action
         self._pending_action = None
@@ -508,9 +469,6 @@ class MainWindow(QMainWindow):
         elif kind == "create":
             name, user_id, on_prog, on_created, on_fail = data
             self._launch_create(name, user_id, on_prog, on_created, on_fail)
-        elif kind == "enroll":
-            uid, badge, on_prog, on_enr, on_fail = data
-            self._launch_enroll(uid, badge, on_prog, on_enr, on_fail)
 
     def delete_user_from_app(self, user_id: str) -> None:
         def on_device_delete(_result) -> None:
@@ -603,25 +561,38 @@ class MainWindow(QMainWindow):
         SettingsDialog(self).exec()
 
     def open_new_user(self) -> None:
-        self.enroll_dialog = NewUserDialog(self)
-        self.enroll_dialog.exec()
+        self.new_user_dialog = NewUserDialog(self)
+        self.new_user_dialog.exec()
 
     # -- weekly ---------------------------------------------------------
     def _check_weekly_on_startup(self) -> None:
-        verifier = WeeklyVerifier(self.db)
-        generated = verifier.generate_previous_week_if_due(datetime.now())
-        if generated is None:
+        if self._weekly_warning_week is not None:
             return
-        under = verifier.under_requirement(generated)
-        if under:
-            names = ", ".join(
-                self.db.user_name(r["user_id"]) or str(r["user_id"]) for r in under
-            )
-            self._show_banner(
-                f"No completaron las 30 horas la semana pasada: {names}. "
-                "Consulta el historial para más detalle.",
-                seconds=10,
-            )
+        week = WeeklyVerifier(self.db).generate_previous_week_if_due(datetime.now())
+        if week is None:
+            return
+        self._weekly_warning_week = week
+        # Wait a moment for the auto-connect + device user sync so the banner
+        # shows user names (not just badge IDs); the display only runs once
+        # per generated week, so it never reappears on every app open.
+        QTimer.singleShot(1500, self._maybe_show_weekly_warning)
+
+    def _maybe_show_weekly_warning(self) -> None:
+        week = self._weekly_warning_week
+        if week is None:
+            return
+        self._weekly_warning_week = None
+        under = WeeklyVerifier(self.db).under_requirement(week)
+        if not under:
+            return
+        names = ", ".join(
+            self.db.user_name(r["user_id"]) or str(r["user_id"]) for r in under
+        )
+        self._show_banner(
+            f"No completaron las 30 horas la semana pasada: {names}. "
+            "Consulta el historial para más detalle.",
+            seconds=10,
+        )
 
     # -- Semanas tab ----------------------------------------------------
     def refresh_semanas(self) -> None:

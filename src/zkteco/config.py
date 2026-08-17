@@ -16,8 +16,7 @@ class DeviceConfig:
     - ``ZKTEco_PORT`` / ``ZK_PORT``: UDP/TCP port (default 4370)
     - ``ZKTEco_TIMEOUT`` / ``ZK_TIMEOUT``: connection timeout in seconds (default 5)
     - ``ZKTEco_PASSWORD``: device comm password (default 0)
-    - ``ZKTEco_UDP`` / ``ZK_UDP``: force UDP transport (default 0; needed on some
-      ZK8-family devices for remote fingerprint enrollment)
+    - ``ZKTEco_UDP`` / ``ZK_UDP``: force UDP transport (default 0)
     """
 
     host: str = field(

@@ -92,7 +92,7 @@ class WeeklyVerifier:
         current_start = week_start_for(now)
         previous_start = current_start - timedelta(days=7)
         last = self.db.last_report_week()
-        if last is not None and last >= current_start:
+        if last is not None and last >= previous_start:
             return None
         self.generate(previous_start)
         return previous_start
