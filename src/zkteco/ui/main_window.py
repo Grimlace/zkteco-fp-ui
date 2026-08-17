@@ -1,22 +1,17 @@
-"""Main window: toolbar, stacked views, "Semanas" tab, auto-connect and capture control."""
+"""Main window: toolbar, stacked views, auto-connect and capture control."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import datetime
 
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QStackedWidget,
-    QTabWidget,
-    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -25,22 +20,12 @@ from PySide6.QtWidgets import (
 from ..config import DeviceConfig
 from ..db import Database
 from ..device import ZKDevice
-from ..report import (
-    MESES_ES,
-    WEEKLY_REQUIREMENT_SECONDS,
-    WeeklyVerifier,
-    format_compact,
-    format_date_range,
-    format_duration,
-    week_short,
-    week_start_for,
-    weeks_between,
-)
+from ..report import WeeklyVerifier, format_duration
 from ..tracker import TimeTracker
 from .settings_dialog import SettingsDialog
 from .theme import set_button_icon
 from .user_dialog import NewUserDialog
-from .views import LiveView, UserDetailView, _make_table
+from .views import LiveView, UserDetailView
 from .worker import (
     ENROLL_PENDING,
     CaptureWorker,
@@ -48,11 +33,6 @@ from .worker import (
     CreateUserWorker,
     DeviceActionWorker,
 )
-
-GREEN_CELL = "#dcfce7"
-RED_CELL = "#fee2e2"
-GREY_CELL = "#f1f5f9"
-CURRENT_WEEK_HINT = "#dbeafe"
 
 
 class MainWindow(QMainWindow):
@@ -108,6 +88,11 @@ class MainWindow(QMainWindow):
         set_button_icon(self.new_user_btn, "user-add", 20)
         self.new_user_btn.clicked.connect(self.open_new_user)
 
+        self.export_btn = QPushButton("Exportar a Excel")
+        set_button_icon(self.export_btn, "export", 20)
+        self.export_btn.setToolTip("Exportar reporte semanal a Excel")
+        self.export_btn.clicked.connect(self.open_export)
+
         self.connection_label = QLabel("Conectando...")
         self.connection_label.setStyleSheet(
             "font-weight: 600; padding: 6px 14px; border-radius: 14px;"
@@ -130,6 +115,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(title)
         tl.addStretch(1)
         tl.addWidget(self.new_user_btn)
+        tl.addWidget(self.export_btn)
         tl.addWidget(self.connection_label)
         tl.addWidget(self.retry_btn)
         tl.addWidget(self.settings_btn)
@@ -143,16 +129,6 @@ class MainWindow(QMainWindow):
         self.live_view.user_selected.connect(self.show_user)
         self.detail_view.back_requested.connect(self.show_live)
 
-        self.tabs = QTabWidget()
-        principal = QWidget()
-        p_layout = QVBoxLayout(principal)
-        p_layout.setContentsMargins(0, 0, 0, 0)
-        p_layout.setSpacing(0)
-        p_layout.addWidget(self.stack)
-        self.tabs.addTab(principal, "Principal")
-        self.tabs.addTab(self._build_semanas_tab(), "Semanas")
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -163,7 +139,7 @@ class MainWindow(QMainWindow):
         self.banner.setWordWrap(True)
         self.banner.hide()
         layout.addWidget(self.banner)
-        layout.addWidget(self.tabs)
+        layout.addWidget(self.stack)
         self.setCentralWidget(central)
 
         self._banner_timer = QTimer(self)
@@ -173,65 +149,6 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_live)
         self.refresh_timer.start(1000)
-
-    def _build_semanas_tab(self) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        filters = QHBoxLayout()
-        filters.addWidget(QLabel("Año:"))
-        self.sem_year = QComboBox()
-        filters.addWidget(self.sem_year)
-        filters.addWidget(QLabel("Mes:"))
-        self.sem_month = QComboBox()
-        self.sem_month.addItem("Todos", 0)
-        for i, mes in enumerate(MESES_ES, start=1):
-            self.sem_month.addItem(mes, i)
-        filters.addWidget(self.sem_month)
-        filters.addStretch(1)
-
-        self.sem_hint = QLabel(
-            "Celdas en horas de la semana (lunes–domingo). Verde = ≥ 30h, "
-            "rojo = < 30h con horas, gris = 0h, azul = semana en curso."
-        )
-        self.sem_hint.setStyleSheet("color: #64748b;")
-        self.sem_hint.setWordWrap(True)
-
-        title = QLabel("Semanas del mes")
-        title.setStyleSheet("font-size: 15px; font-weight: 700;")
-
-        self.sem_table = _make_table(["Usuario"])
-
-        layout.addLayout(filters)
-        layout.addWidget(title)
-        layout.addWidget(self.sem_hint)
-        layout.addWidget(self.sem_table)
-
-        self.refresh_sem_year_options(initial=datetime.now().year)
-        self.sem_month.setCurrentIndex(self.sem_month.findData(datetime.now().month))
-        self.sem_year.currentIndexChanged.connect(self.refresh_semanas)
-        self.sem_month.currentIndexChanged.connect(self.refresh_semanas)
-        return container
-
-    def refresh_sem_year_options(self, initial: int | None = None) -> None:
-        today = date.today()
-        first = today
-        oldest = self.db.min_session_date()
-        if oldest is not None:
-            first = min(first, oldest)
-        years = list(range(first.year, today.year + 1)) or [today.year]
-        self.sem_year.blockSignals(True)
-        self.sem_year.clear()
-        for y in years:
-            self.sem_year.addItem(str(y))
-        idx = max(0, self.sem_year.findText(str(initial or today.year)))
-        self.sem_year.setCurrentIndex(idx)
-        self.sem_year.blockSignals(False)
-
-    def on_tab_changed(self, index: int) -> None:
-        if index == 1:
-            self.refresh_semanas()
 
     def set_status(self, text: str) -> None:
         self.last_status = text
@@ -623,6 +540,11 @@ class MainWindow(QMainWindow):
         self.new_user_dialog = NewUserDialog(self)
         self.new_user_dialog.exec()
 
+    def open_export(self) -> None:
+        from .export_dialog import ExportDialog
+
+        ExportDialog(self).exec()
+
     # -- weekly ---------------------------------------------------------
     def _check_weekly_on_startup(self) -> None:
         if self._weekly_warning_week is not None:
@@ -653,85 +575,9 @@ class MainWindow(QMainWindow):
             seconds=10,
         )
 
-    # -- Semanas tab ----------------------------------------------------
-    def refresh_semanas(self) -> None:
-        if not hasattr(self, "sem_table"):
-            return
-        year = int(self.sem_year.currentText())
-        month = self.sem_month.currentData() or 0
-        weeks = weeks_between(date(year, 1, 1), date(year, 12, 31))
-        if month:
-            weeks = [w for w in weeks if w.month == month]
-        if not weeks:
-            self.sem_table.setRowCount(0)
-            self.sem_table.setColumnCount(1)
-            self.sem_table.setHorizontalHeaderLabels(["Usuario"])
-            return
-
-        headers = ["Usuario"] + [week_short(w) for w in weeks]
-        self.sem_table.setColumnCount(len(headers))
-        self.sem_table.setHorizontalHeaderLabels(headers)
-        for i, w in enumerate(weeks):
-            item = self.sem_table.horizontalHeaderItem(i + 1)
-            item.setToolTip(format_date_range(w, w + timedelta(days=6)))
-
-        today = date.today()
-        current_week = week_start_for(today) if today.year == year else None
-
-        first = weeks[0]
-        last = weeks[-1] + timedelta(days=6)
-        week_set = set(weeks)
-        totals: dict[tuple[str, date], float] = defaultdict(float)
-        for s in self.db.sessions_in_range(first, last):
-            day = date.fromisoformat(s["clock_in_at"][:10])
-            wk = week_start_for(day)
-            if wk in week_set:
-                totals[(s["user_id"], wk)] += float(s["session_seconds"] or 0)
-
-        for user in self.db.all_users():
-            uid = user["user_id"]
-            open_ = self.db.open_session(uid)
-            if open_:
-                start = datetime.fromisoformat(open_["clock_in_at"])
-                wk = week_start_for(start.date())
-                if wk in week_set:
-                    running = max(0.0, (datetime.now() - start).total_seconds())
-                    totals[(uid, wk)] = totals.get((uid, wk), 0.0) + running
-
-        users = self.db.all_users()
-        self.sem_table.setRowCount(len(users))
-        for r, user in enumerate(users):
-            uid = user["user_id"]
-            name_item = QTableWidgetItem(user["name"] or uid)
-            name_item.setToolTip(f"ID: {uid}")
-            self.sem_table.setItem(r, 0, name_item)
-            for c, w in enumerate(weeks):
-                secs = totals.get((uid, w), 0.0)
-                value = format_compact(secs) if secs else "–"
-                cell = QTableWidgetItem(value)
-                cell.setTextAlignment(Qt.AlignCenter)
-                if secs >= WEEKLY_REQUIREMENT_SECONDS:
-                    bg = GREEN_CELL
-                elif secs > 0:
-                    bg = RED_CELL
-                elif current_week == w:
-                    bg = CURRENT_WEEK_HINT
-                else:
-                    bg = GREY_CELL
-                cell.setBackground(QColor(bg))
-                if secs:
-                    cell.setToolTip(f"{format_duration(secs)} ({week_short(w)})")
-                self.sem_table.setItem(r, c + 1, cell)
-        self.sem_hint.setText(
-            "Celdas en horas de la semana (lunes–domingo). Verde = ≥ 30h, rojo = < 30h con horas, "
-            "gris = 0h, azul = semana en curso."
-        )
-
     # -- refresh --------------------------------------------------------
     def refresh_all(self) -> None:
         self.refresh_live()
-        if hasattr(self, "tabs") and self.tabs.currentIndex() == 1:
-            self.refresh_semanas()
 
     def refresh_live(self) -> None:
         if self._closing:
