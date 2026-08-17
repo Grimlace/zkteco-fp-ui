@@ -82,6 +82,10 @@ class MainWindow(QMainWindow):
         self._workers: set = set()
         self._create_worker = None
         self._weekly_warning_week = None
+        self._capture_error_message: str | None = None
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._do_reconnect)
 
         self._build_ui()
         self._check_weekly_on_startup()
@@ -255,38 +259,15 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.detail_view)
 
     # -- connection -----------------------------------------------------
-    def auto_connect(self) -> None:
-        if not self.config.host:
-            self.connection_label.setText("Sin IP configurada (ve a ⚙)")
-            self.set_status("Sin IP configurada")
-            return
-        self.connection_label.setText("Conectando...")
-        self.set_status("Conectando...")
-        self.retry_btn.hide()
-        self.connect_worker = ConnectWorker(self.config)
-        self.connect_worker.connected.connect(self.on_connected)
-        self.connect_worker.failed.connect(self.on_connect_failed)
-        self._spawn(self.connect_worker)
-        self.connect_worker.start()
-
-    def retry_connect(self) -> None:
-        if self.connect_worker is not None and self.connect_worker.isRunning():
-            return
-        self.auto_connect()
-
-    def connect_device(self) -> None:
-        if self.connected:
-            self.disconnect_device()
-            return
-        self.auto_connect()
-
     def on_connected(self, name: str) -> None:
+        self._reconnect_timer.stop()
         if self.connect_worker is not None and self.connect_worker.device is not None:
             self.device = self.connect_worker.device
         if self.device is None:
             self.on_connect_failed("dispositivo inválido")
             return
         self.connected = True
+        self._capture_error_message = None
         self.sync_users_from_device()
         self._sync_device_time_silent()
         self.connection_label.setText(f"Conectado: {name} ({self.config.host})")
@@ -310,18 +291,69 @@ class MainWindow(QMainWindow):
         self.set_status(f"No se pudo conectar: {reason}")
         self.connection_label.setToolTip(reason)
         self.retry_btn.show()
+        self._schedule_reconnect()
 
     def disconnect_device(self) -> None:
+        self._reconnect_timer.stop()
         if self.capturing:
             self.stop_capture()
         if self.device is not None:
             self.device.disconnect()
         self.device = None
         self.connected = False
+        self._capture_error_message = None
         self.retry_btn.hide()
         self.connection_label.setText("Desconectado")
         self.connection_label.setStyleSheet("font-weight: bold;")
         self.set_status("Desconectado")
+
+    # -- auto-reconnect -------------------------------------------------
+    def _schedule_reconnect(self) -> None:
+        """Queue a reconnection attempt in a few seconds (idempotent)."""
+        if self._closing or not self.config.host:
+            return
+        if self.connected:
+            return
+        if self.connect_worker is not None and self.connect_worker.isRunning():
+            return
+        if not self._reconnect_timer.isActive():
+            self.set_status("Conexión perdida; reintentando automáticamente...")
+            self._reconnect_timer.start(3000)
+
+    def _do_reconnect(self) -> None:
+        if self._closing or not self.config.host:
+            return
+        if self.connected:
+            return
+        if self.connect_worker is not None and self.connect_worker.isRunning():
+            return
+        self.auto_connect()
+
+    def auto_connect(self) -> None:
+        if not self.config.host:
+            self.connection_label.setText("Sin IP configurada (ve a ⚙)")
+            self.set_status("Sin IP configurada")
+            return
+        self.connection_label.setText("Conectando...")
+        self.set_status("Conectando...")
+        self.retry_btn.hide()
+        self.connect_worker = ConnectWorker(self.config)
+        self.connect_worker.connected.connect(self.on_connected)
+        self.connect_worker.failed.connect(self.on_connect_failed)
+        self._spawn(self.connect_worker)
+        self.connect_worker.start()
+
+    def retry_connect(self) -> None:
+        if self.connect_worker is not None and self.connect_worker.isRunning():
+            return
+        self._reconnect_timer.stop()
+        self.auto_connect()
+
+    def connect_device(self) -> None:
+        if self.connected:
+            self.disconnect_device()
+            return
+        self.auto_connect()
 
     def sync_users_from_device(self) -> None:
         if self.device is None:
@@ -532,11 +564,38 @@ class MainWindow(QMainWindow):
             self.worker.stop()
 
     def on_capture_error(self, message: str) -> None:
+        self._capture_error_message = message
         self.set_status(f"Error de captura: {message}")
+        self._on_device_lost(message)
+
+    def _on_device_lost(self, message: str) -> None:
+        """The device connection died (e.g. reboot, cable, power). Mark it as
+        disconnected in real time and schedule an automatic reconnection."""
+        self.connected = False
+        self._pending_action = None
+        self._restart_capture_after_action = False
+        if self.device is not None:
+            try:
+                self.device.disconnect()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        self.device = None
+        self.connection_label.setText("Sin conexión")
+        self.connection_label.setStyleSheet(
+            "font-weight: 600; padding: 6px 14px; border-radius: 14px;"
+            " background: #fee2e2; color: #b91c1c;"
+        )
+        self.connection_label.setToolTip(message)
+        self.retry_btn.show()
+        self.set_status(f"Conexión perdida: {message}")
+        self._schedule_reconnect()
 
     def on_capture_stopped(self) -> None:
         self.capturing = False
         self.worker = None
+        if self._capture_error_message is not None:
+            self._capture_error_message = None
+            return
         self.set_status("Captura detenida")
         had_pending = self._pending_action is not None
         self._dispatch_pending_action()
