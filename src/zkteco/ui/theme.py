@@ -51,6 +51,15 @@ QLabel#titleLabel {
     font-weight: 700;
 }
 
+QLabel#noticeBanner {
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #f59e0b;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin: 0 12px;
+}
+
 QToolButton {
     background: transparent;
     border: none;

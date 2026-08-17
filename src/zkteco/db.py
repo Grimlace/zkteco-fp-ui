@@ -202,6 +202,24 @@ class Database:
         query += " ORDER BY clock_in_at ASC"
         return self._conn.execute(query, params).fetchall()
 
+    def sessions_in_range(
+        self, start: date, end: date
+    ) -> list[sqlite3.Row]:
+        """Sessions whose clock-in falls in ``[start, end]`` inclusive."""
+        return self._conn.execute(
+            "SELECT * FROM sessions WHERE date(clock_in_at) >= date(?) "
+            "AND date(clock_in_at) <= date(?) ORDER BY clock_in_at ASC",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    def min_session_date(self) -> Optional[date]:
+        row = self._conn.execute(
+            "SELECT MIN(clock_in_at) m FROM sessions"
+        ).fetchone()
+        if row and row["m"]:
+            return parse_iso(row["m"]).date()
+        return None
+
     def all_open_sessions(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM sessions WHERE clock_out_at IS NULL ORDER BY clock_in_at ASC"

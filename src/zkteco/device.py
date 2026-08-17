@@ -24,6 +24,7 @@ class ZKDevice:
             port=config.port,
             timeout=config.timeout,
             password=config.password,
+            force_udp=config.force_udp,
         )
         self._conn = None
 

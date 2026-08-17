@@ -20,8 +20,9 @@ MESES_ES = [
 
 
 def week_start_for(value: datetime | date) -> date:
-    """Return the Monday of the week containing ``value``."""
-    return value.date() - timedelta(days=value.weekday())
+    """Return the Monday of the week containing ``value`` (date or datetime)."""
+    day = value.date() if isinstance(value, datetime) else value
+    return day - timedelta(days=day.weekday())
 
 
 def week_end_for(value: datetime | date) -> date:
@@ -34,6 +35,29 @@ def week_label(value: datetime | date) -> str:
     start = week_start_for(value)
     end = week_end_for(value)
     return f"{MESES_ES[end.month - 1].capitalize()} {end.year} (del {start.day} al {end.day})"
+
+
+def week_short(value: datetime | date) -> str:
+    """Compressed Mon-Sun range for a week, e.g. ``"03/08 – 09/08"``."""
+    start = week_start_for(value)
+    end = week_end_for(value)
+    return f"{start.day:02d}/{start.month:02d} – {end.day:02d}/{end.month:02d}"
+
+
+def weeks_between(first: date, last: date) -> list[date]:
+    """Mondays for every week from ``first`` to ``last`` inclusive."""
+    weeks: list[date] = []
+    wk = week_start_for(first)
+    end = week_start_for(last)
+    while wk <= end:
+        weeks.append(wk)
+        wk += timedelta(days=7)
+    return weeks
+
+
+def format_date_range(start: date, end: date) -> str:
+    """Spanish range like ``"del 03/08/2026 al 09/08/2026 (lun–dom)"``."""
+    return f"del {start:%d/%m/%Y} al {end:%d/%m/%Y} (lun–dom)"
 
 
 def format_duration(total_seconds: float) -> str:

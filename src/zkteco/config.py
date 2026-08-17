@@ -16,6 +16,8 @@ class DeviceConfig:
     - ``ZKTEco_PORT`` / ``ZK_PORT``: UDP/TCP port (default 4370)
     - ``ZKTEco_TIMEOUT`` / ``ZK_TIMEOUT``: connection timeout in seconds (default 5)
     - ``ZKTEco_PASSWORD``: device comm password (default 0)
+    - ``ZKTEco_UDP`` / ``ZK_UDP``: force UDP transport (default 0; needed on some
+      ZK8-family devices for remote fingerprint enrollment)
     """
 
     host: str = field(
@@ -33,6 +35,10 @@ class DeviceConfig:
         default_factory=lambda: int(
             os.getenv("ZKTEco_PASSWORD", os.getenv("ZK_PASSWORD", "0"))
         )
+    )
+    force_udp: bool = field(
+        default_factory=lambda: os.getenv("ZKTEco_UDP", os.getenv("ZK_UDP", "0")).strip()
+        in ("1", "true", "yes", "on")
     )
 
     def validate(self) -> None:

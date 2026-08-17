@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QDateEdit,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -17,12 +19,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..report import format_duration
+from ..report import format_date_range, format_duration, week_start_for
 from .theme import set_button_icon, style_table
 from .widgets import ProgressCell, WeeklyHistoryWidget
 
 LIVE_COLUMNS = ["#", "Nombre", "ID", "Estado", "Esta semana", "Progreso (30h)", "Total"]
 DETAIL_COLUMNS = ["Fecha", "Entrada", "Salida", "Duración"]
+
+BAND_COLOR = QColor("#eef2f7")
 
 
 def _make_table(columns: list[str]) -> QTableWidget:
@@ -117,18 +121,32 @@ class UserDetailView(QWidget):
 
         self.weekly = WeeklyHistoryWidget()
 
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Desde:"))
+        self.from_date = QDateEdit(calendarPopup=True)
+        self.from_date.setDate(date.today())
+        filters.addWidget(self.from_date)
+        filters.addWidget(QLabel("Hasta:"))
+        self.to_date = QDateEdit(calendarPopup=True)
+        self.to_date.setDate(date.today())
+        filters.addWidget(self.to_date)
+        load = QPushButton("Cargar")
+        load.clicked.connect(self.refresh_sessions)
+        filters.addWidget(load)
+        filters.addStretch(1)
+
         self.table = _make_table(DETAIL_COLUMNS)
+        self.table.verticalHeader().setDefaultSectionSize(40)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(header)
         layout.addWidget(QLabel("Historial semanal:"))
         layout.addWidget(self.weekly)
-        layout.addWidget(QLabel("Sesiones:"))
+        layout.addWidget(QLabel("Sesiones por semana:"))
+        layout.addLayout(filters)
         layout.addWidget(self.table)
 
     def show_user(self, user_id: str) -> None:
-        from PySide6.QtWidgets import QMessageBox
-
         self.user_id = user_id
         name = self.window.tracker.db.user_name(user_id) or user_id
         self.title.setText(f"{name}  ·  ID {user_id}")
@@ -138,26 +156,56 @@ class UserDetailView(QWidget):
         active = bool(active_row and active_row["active"]) if active_row else True
         self.activate_btn.setText("Desactivar" if active else "Activar")
         self.weekly.set_weeks(self.window.tracker.db.user_weekly_history(user_id))
+
+        rows = self.window.tracker.db.sessions_for(user_id=user_id)
+        if rows:
+            first = min(datetime.fromisoformat(s["clock_in_at"]).date() for s in rows)
+        else:
+            first = date.today()
+        self.from_date.setDate(first)
+        self.to_date.setDate(date.today())
         self.refresh_sessions()
 
-    def refresh_sessions(self) -> None:
+    def _group_sessions(self):
         if self.user_id is None:
-            return
-        rows = self.window.tracker.db.sessions_for(user_id=self.user_id)
-        self.table.setRowCount(len(rows))
-        for r, s in enumerate(reversed(rows)):
-            clock_in = datetime.fromisoformat(s["clock_in_at"])
-            out = s["clock_out_at"]
-            out_dt = datetime.fromisoformat(out) if out else None
-            fecha = f"{clock_in:%Y-%m-%d}"
-            self.table.setItem(r, 0, QTableWidgetItem(fecha))
-            self.table.setItem(r, 1, QTableWidgetItem(f"{clock_in:%H:%M:%S}"))
-            self.table.setItem(r, 2, QTableWidgetItem(f"{out_dt:%H:%M:%S}" if out_dt else "en curso"))
-            self.table.setItem(r, 3, QTableWidgetItem(format_duration(s["session_seconds"] or 0)))
+            return []
+        start = self.from_date.date().toPython()
+        end = self.to_date.date().toPython()
+        groups: dict[date, list] = defaultdict(list)
+        for s in self.window.tracker.db.sessions_for(user_id=self.user_id):
+            day = datetime.fromisoformat(s["clock_in_at"]).date()
+            if start <= day <= end:
+                wk = week_start_for(day)
+                groups[wk].append(s)
+        return sorted(groups.items(), key=lambda kv: kv[0], reverse=True)
+
+    def refresh_sessions(self) -> None:
+        grouped = self._group_sessions()
+        self.table.setRowCount(sum(len(items) + 1 for _, items in grouped))
+        r = 0
+        for wk, items in grouped:
+            items = sorted(items, key=lambda s: s["clock_in_at"], reverse=True)
+            total = sum(float(s["session_seconds"] or 0) for s in items)
+            band = QTableWidgetItem(
+                f"Sesión por semana · {format_duration(total)}   ({format_date_range(wk, wk + timedelta(days=6))})"
+            )
+            band.setBackground(BAND_COLOR)
+            font = band.font()
+            font.setBold(True)
+            band.setFont(font)
+            self.table.setItem(r, 0, band)
+            self.table.setSpan(r, 0, 1, self.table.columnCount())
+            r += 1
+            for s in items:
+                clock_in = datetime.fromisoformat(s["clock_in_at"])
+                out_dt = datetime.fromisoformat(s["clock_out_at"]) if s["clock_out_at"] else None
+                self.table.setItem(r, 0, QTableWidgetItem(f"{clock_in:%Y-%m-%d}"))
+                self.table.setItem(r, 1, QTableWidgetItem(f"{clock_in:%H:%M:%S}"))
+                self.table.setItem(r, 2, QTableWidgetItem(f"{out_dt:%H:%M:%S}" if out_dt else "en curso"))
+                self.table.setItem(r, 3, QTableWidgetItem(format_duration(s["session_seconds"] or 0)))
+                r += 1
 
     def toggle_active(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
-
         if self.user_id is None:
             return
         row = self.window.tracker.db._conn.execute(
@@ -177,9 +225,8 @@ class UserDetailView(QWidget):
         answer = QMessageBox.question(
             self,
             "Eliminar usuario",
-            f"¿Eliminar a {name} y todas sus sesiones? Esta acción no se puede deshacer.",
+            f"¿Eliminar a {name} del dispositivo y de la base de datos? "
+            "Esta acción no se puede deshacer.",
         )
         if answer == QMessageBox.Yes:
-            self.window.tracker.db.remove_user(self.user_id)
-            self.window.refresh_all()
-            self.back_requested.emit()
+            self.window.delete_user_from_app(self.user_id)

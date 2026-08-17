@@ -1,18 +1,60 @@
-"""Background workers: connect, capture fingerprint events, enroll users."""
+"""Background workers: connect, capture, create/enroll users and generic device actions.
+
+Create and enroll are split into two steps so the user record exists on the
+device *before* the fingerprint scanner is activated (some ZK8-family devices,
+like the K30, reject ``enroll_user`` for a user that does not exist yet, and
+only accept remote enrollment over UDP).
+
+Device write operations run on a *separate* connection so they never interfere
+with the live-capture socket; ``DeviceActionWorker``, ``CreateUserWorker`` and
+``EnrollWorker`` try UDP first and then fall back to TCP.
+"""
 
 from __future__ import annotations
+
+import dataclasses
+from typing import Any, Callable
 
 from PySide6.QtCore import QThread, Signal
 
 from ..config import DeviceConfig
 from ..device import ZKDevice
 
+ENROLL_PENDING = "pending"
+"""Sentinel returned when a device operation is queued until the live capture
+has fully stopped (single-socket devices)."""
+
+
+def _with_fallback(
+    config: DeviceConfig,
+    progress: Callable[[str], None],
+    operation: Callable[[Any], None],
+    udp_first: bool = False,
+) -> None:
+    """Run ``operation(conn)`` trying UDP and TCP (order controlled by
+    ``udp_first``). Raises on failure."""
+    transports = ((True, "UDP"), (False, "TCP")) if udp_first else ((False, "TCP"), (True, "UDP"))
+    last_error: str | None = None
+    for force_udp, transport in transports:
+        cfg = dataclasses.replace(config, force_udp=force_udp)
+        device = ZKDevice(cfg)
+        try:
+            device.connect()
+            progress(f"Conectando al dispositivo ({transport})...")
+            operation(device._conn)  # type: ignore[union-attr]
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{transport}: {exc}"
+        finally:
+            try:
+                device.disconnect()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+    raise RuntimeError(last_error or "sin respuesta del dispositivo")
+
 
 class ConnectWorker(QThread):
-    """Connects to the device in the background.
-
-    On success emits ``connected(device_name)``; otherwise ``failed(reason)``.
-    """
+    """Connects to the device in the background."""
 
     connected = Signal(str)
     failed = Signal(str)
@@ -65,43 +107,127 @@ class CaptureWorker(QThread):
             self.stopped.emit()
 
 
-class EnrollWorker(QThread):
-    """Enrolls a new fingerprint on the device.
+class DeviceActionWorker(QThread):
+    """Runs a device operation on its own connection.
 
-    Steps: enroll the finger (device lights up), create the user record on the
-    device, then persist the template.
+    ``action`` receives a fresh pyzk connection (``ZK._conn``) and returns the
+    result. ``ok`` emits the result, ``failed`` emits the error message.
+    """
+
+    ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: DeviceConfig, action: Callable[[Any], Any]) -> None:
+        super().__init__()
+        self.config = config
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            _with_fallback(
+                self.config,
+                lambda _msg: None,
+                lambda conn: self.ok.emit(self.action(conn)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class CreateUserWorker(QThread):
+    """Step 1: create the user record on the device (ID + name).
+
+    Computes the next free UID, writes the user with ``set_user`` and emits
+    ``created(user_id, uid)``. The fingerprint is enrolled later in step 2.
     """
 
     progress = Signal(str)
-    enrolled = Signal(str)  # user_id (badge) that was enrolled
+    created = Signal(str, int)
     failed = Signal(str)
 
-    def __init__(self, device: ZKDevice, uid: int, user_id: str, name: str) -> None:
+    def __init__(
+        self, config: DeviceConfig, name: str, user_id: str | None = None
+    ) -> None:
         super().__init__()
-        self.device = device
-        self.uid = uid
-        self.user_id = user_id
+        self.config = config
         self.name = name
+        self.user_id = user_id
+        self.uid: int | None = None
+        self.badge: str | None = None
 
     def run(self) -> None:
-        conn = self.device._conn  # type: ignore[union-attr]
-        try:
-            self.progress.emit("Coloca tu dedo en el sensor...")
-            ok = conn.enroll_user(uid=self.uid, temp_id=0, user_id=self.user_id)
-            if not ok:
-                self.failed.emit("No se pudo registrar la huella (intenta de nuevo).")
-                return
-            self.progress.emit("Huella registrada, guardando usuario...")
+        def operation(conn: Any) -> None:
+            try:
+                conn.cancel_capture()
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+            uids = [u.uid for u in conn.get_users()]
+            next_uid = (max(uids) + 1) if uids else 1
+            badge = self.user_id or str(next_uid)
+            self.uid = next_uid
+            self.badge = badge
+            self.progress.emit(f"Creando el usuario {self.name} en el dispositivo...")
             conn.set_user(
-                uid=self.uid,
+                uid=next_uid,
                 name=self.name,
                 privilege=0,
                 password="",
                 group_id="",
-                user_id=self.user_id,
+                user_id=badge,
                 card=0,
             )
-            conn.save_user_template(uid=self.uid, temp_id=0, user_id=self.user_id)
-            self.enrolled.emit(self.user_id)
+            self.progress.emit(
+                f"Usuario {self.name} (ID {badge}, UID {next_uid}) creado en el dispositivo."
+            )
+
+        try:
+            _with_fallback(self.config, self.progress.emit, operation)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
+            return
+        self.created.emit(self.badge or "", self.uid or 0)
+
+
+class EnrollWorker(QThread):
+    """Step 2: register a fingerprint for an existing device user.
+
+    Activates the device fingerprint scanner and registers the finger to the
+    user previously created with ``CreateUserWorker``.
+    """
+
+    progress = Signal(str)
+    enrolled = Signal(str, int)
+    failed = Signal(str)
+
+    def __init__(self, config: DeviceConfig, uid: int, badge: str) -> None:
+        super().__init__()
+        self.config = config
+        self.uid = uid
+        self.badge = badge
+
+    def run(self) -> None:
+        def operation(conn: Any) -> None:
+            try:
+                conn.cancel_capture()
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+            self.progress.emit(
+                f"Coloca el dedo en el sensor y mantenlo apoyado… "
+                f"(ID {self.badge}, UID {self.uid})"
+            )
+            ok = conn.enroll_user(uid=self.uid, temp_id=0, user_id=self.badge)
+            if not ok:
+                raise RuntimeError("el dispositivo no leyó la huella")
+            self.progress.emit("Huella registrada, guardando...")
+            conn.save_user_template(self.uid)
+            self.progress.emit("Huella guardada en el dispositivo.")
+
+        try:
+            # ZK8-family devices (K30) only accept remote fingerprint
+            # enrollment over UDP, so try UDP first, then TCP.
+            _with_fallback(
+                self.config, self.progress.emit, operation, udp_first=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.enrolled.emit(self.badge, self.uid)
